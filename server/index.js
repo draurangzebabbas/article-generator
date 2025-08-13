@@ -257,15 +257,72 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       status: 'pending'
     });
 
-    // Get user's OpenRouter API keys
+    // Get user's OpenRouter API keys with smart recovery
     console.log(`🔍 Looking for API keys for user: ${req.user.id}`);
     
-    const { data: apiKeys, error: keysError } = await supabase
+    // Smart recovery: Test failed keys before reactivating (10-hour recovery)
+    const tenHoursAgo = new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString();
+    
+    // Get failed keys that are older than 10 hours
+    const { data: failedKeys } = await supabase
       .from('api_keys')
       .select('*')
       .eq('user_id', req.user.id)
       .eq('provider', 'openrouter')
-      .eq('status', 'active');  // Simplified to just 'active' for now
+      .eq('status', 'failed')
+      .lt('last_failed', tenHoursAgo);
+    
+    // Test each failed key before reactivating
+    if (failedKeys && failedKeys.length > 0) {
+      console.log(`🔄 Testing ${failedKeys.length} failed keys for recovery...`);
+      
+      for (const key of failedKeys) {
+        try {
+          // Test the key with a simple API call
+          const testResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${key.api_key}`,
+              'Content-Type': 'application/json',
+              'HTTP-Referer': OPENROUTER_REFERER,
+              'X-Title': OPENROUTER_TITLE
+            },
+            body: JSON.stringify({
+              model: 'deepseek/deepseek-chat-v3-0324:free',
+              messages: [{ role: 'user', content: 'Test' }],
+              max_tokens: 10
+            })
+          });
+          
+          if (testResponse.ok) {
+            // Key is working - reactivate it
+            await supabase
+              .from('api_keys')
+              .update({ 
+                status: 'active', 
+                failure_count: 0,
+                last_used: new Date().toISOString()
+              })
+              .eq('id', key.id);
+            console.log(`✅ Reactivated key: ${key.key_name}`);
+          } else {
+            // Key is still broken - keep it failed
+            console.log(`❌ Key still broken: ${key.key_name} (${testResponse.status})`);
+          }
+        } catch (error) {
+          // Key test failed - keep it failed
+          console.log(`❌ Key test failed: ${key.key_name} (${error.message})`);
+        }
+      }
+    }
+    
+    // Get available keys (active + rate_limited)
+    let { data: apiKeys, error: keysError } = await supabase
+      .from('api_keys')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .eq('provider', 'openrouter')
+      .in('status', ['active', 'rate_limited']);
 
     console.log(`🔍 API keys query result:`, { apiKeys, keysError });
 
@@ -357,9 +414,11 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
           console.error(`❌ Error in ${moduleName} with API key ${currentKey.key_name}:`, error.message);
           
           // Check if it's a rate limit, credit issue, or invalid key
-          const isRateLimit = error.message.includes('rate') || error.message.includes('credit') || error.message.includes('429');
+          const isRateLimit = error.message.includes('rate') || error.message.includes('credit') || error.message.includes('429') || error.message.includes('402');
           const isInvalidKey = error.message.includes('Invalid API key') || error.message.includes('401');
+          const isNetworkError = error.message.includes('network') || error.message.includes('timeout') || error.message.includes('fetch');
           
+          // Never permanently block keys - all keys can recover after 10 hours
           if (isRateLimit) {
             await supabase.from('api_keys').update({
               status: 'rate_limited',
@@ -367,20 +426,14 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
               failure_count: currentKey.failure_count + 1
             }).eq('id', currentKey.id);
             console.log(`⚠️ Marked API key as rate limited: ${currentKey.key_name}`);
-          } else if (isInvalidKey) {
-            await supabase.from('api_keys').update({
-              status: 'failed',
-              last_failed: new Date().toISOString(),
-              failure_count: currentKey.failure_count + 1
-            }).eq('id', currentKey.id);
-            console.log(`❌ Marked API key as failed: ${currentKey.key_name}`);
           } else {
+            // For all other errors (including invalid keys), mark as failed but allow recovery after 10 hours
             await supabase.from('api_keys').update({
               status: 'failed',
               last_failed: new Date().toISOString(),
               failure_count: currentKey.failure_count + 1
             }).eq('id', currentKey.id);
-            console.log(`⚠️ Marked API key as failed: ${currentKey.key_name}`);
+            console.log(`⚠️ Marked API key as failed (will recover after 10 hours): ${currentKey.key_name} (${currentKey.failure_count + 1} failures)`);
           }
 
           attempts++;
@@ -716,13 +769,70 @@ app.post('/api/generate-article-webhook', rateLimitMiddleware, authMiddleware, a
       status: 'pending'
     });
 
-    // Get user's OpenRouter API keys
+    // Get user's OpenRouter API keys with smart recovery
+    // Smart recovery: Test failed keys before reactivating (10-hour recovery)
+    const tenHoursAgo = new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString();
+    
+    // Get failed keys that are older than 10 hours
+    const { data: failedKeys } = await supabase
+      .from('api_keys')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .eq('provider', 'openrouter')
+      .eq('status', 'failed')
+      .lt('last_failed', tenHoursAgo);
+    
+    // Test each failed key before reactivating
+    if (failedKeys && failedKeys.length > 0) {
+      console.log(`🔄 Testing ${failedKeys.length} failed keys for recovery...`);
+      
+      for (const key of failedKeys) {
+        try {
+          // Test the key with a simple API call
+          const testResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${key.api_key}`,
+              'Content-Type': 'application/json',
+              'HTTP-Referer': OPENROUTER_REFERER,
+              'X-Title': OPENROUTER_TITLE
+            },
+            body: JSON.stringify({
+              model: 'deepseek/deepseek-chat-v3-0324:free',
+              messages: [{ role: 'user', content: 'Test' }],
+              max_tokens: 10
+            })
+          });
+          
+          if (testResponse.ok) {
+            // Key is working - reactivate it
+            await supabase
+              .from('api_keys')
+              .update({ 
+                status: 'active', 
+                failure_count: 0,
+                last_used: new Date().toISOString()
+              })
+              .eq('id', key.id);
+            console.log(`✅ Reactivated key: ${key.key_name}`);
+          } else {
+            // Key is still broken - keep it failed
+            console.log(`❌ Key still broken: ${key.key_name} (${testResponse.status})`);
+          }
+        } catch (error) {
+          // Key test failed - keep it failed
+          console.log(`❌ Key test failed: ${key.key_name} (${error.message})`);
+        }
+      }
+    }
+    
+    // Get available keys (active + rate_limited)
     const { data: apiKeys, error: keysError } = await supabase
       .from('api_keys')
       .select('*')
       .eq('user_id', req.user.id)
       .eq('provider', 'openrouter')
-      .eq('status', 'active');  // Simplified to just 'active' for now
+      .in('status', ['active', 'rate_limited']);
 
     console.log(`🔍 API keys query result:`, { apiKeys, keysError });
 
@@ -882,21 +992,125 @@ app.get('/api/debug/keys', rateLimitMiddleware, authMiddleware, async (req, res)
   try {
     const { data: apiKeys, error } = await supabase
       .from('api_keys')
-      .select('id, key_name, provider, status, last_used, failure_count')
+      .select('id, key_name, provider, status, last_used, last_failed, failure_count')
       .eq('user_id', req.user.id);
 
     if (error) {
       return res.status(500).json({ error: 'Failed to fetch API keys', message: error.message });
     }
 
+    // Group keys by status
+    const activeKeys = apiKeys.filter(k => k.status === 'active');
+    const rateLimitedKeys = apiKeys.filter(k => k.status === 'rate_limited');
+    const failedKeys = apiKeys.filter(k => k.status === 'failed');
+
     res.json({ 
       status: 'success', 
       api_keys: apiKeys,
-      total_keys: apiKeys.length,
-      active_keys: apiKeys.filter(k => k.status === 'active').length
+      summary: {
+        total_keys: apiKeys.length,
+        active_keys: activeKeys.length,
+        rate_limited_keys: rateLimitedKeys.length,
+        failed_keys: failedKeys.length
+      },
+      by_status: {
+        active: activeKeys,
+        rate_limited: rateLimitedKeys,
+        failed: failedKeys
+      }
     });
   } catch (error) {
     res.status(500).json({ error: 'Debug failed', message: error.message });
+  }
+});
+
+// Manual key recovery endpoint (requires auth)
+app.post('/api/recover-keys', rateLimitMiddleware, authMiddleware, async (req, res) => {
+  try {
+    const { key_ids } = req.body; // Optional: specific key IDs to recover
+    
+    // Get failed keys
+    let query = supabase
+      .from('api_keys')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .eq('provider', 'openrouter')
+      .eq('status', 'failed');
+    
+    if (key_ids && Array.isArray(key_ids) && key_ids.length > 0) {
+      query = query.in('id', key_ids);
+    }
+    
+    const { data: failedKeys, error } = await query;
+    
+    if (error) {
+      return res.status(500).json({ error: 'Failed to fetch failed keys', message: error.message });
+    }
+    
+    if (!failedKeys || failedKeys.length === 0) {
+      return res.json({ 
+        status: 'success', 
+        message: 'No failed keys to recover (all keys are either active, rate_limited, or failed less than 10 hours ago)',
+        recovered: 0,
+        still_failed: 0
+      });
+    }
+    
+    console.log(`🔄 Manually testing ${failedKeys.length} failed keys...`);
+    
+    let recovered = 0;
+    let stillFailed = 0;
+    
+    for (const key of failedKeys) {
+      try {
+        // Test the key with a simple API call
+        const testResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${key.api_key}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': OPENROUTER_REFERER,
+            'X-Title': OPENROUTER_TITLE
+          },
+          body: JSON.stringify({
+            model: 'deepseek/deepseek-chat-v3-0324:free',
+            messages: [{ role: 'user', content: 'Test' }],
+            max_tokens: 10
+          })
+        });
+        
+        if (testResponse.ok) {
+          // Key is working - reactivate it
+          await supabase
+            .from('api_keys')
+            .update({ 
+              status: 'active', 
+              failure_count: 0,
+              last_used: new Date().toISOString()
+            })
+            .eq('id', key.id);
+          console.log(`✅ Manually recovered key: ${key.key_name}`);
+          recovered++;
+        } else {
+          console.log(`❌ Key still broken: ${key.key_name} (${testResponse.status})`);
+          stillFailed++;
+        }
+      } catch (error) {
+        console.log(`❌ Key test failed: ${key.key_name} (${error.message})`);
+        stillFailed++;
+      }
+    }
+    
+    res.json({ 
+      status: 'success', 
+      message: `Recovery attempt completed`,
+      recovered,
+      still_failed: stillFailed,
+      total_tested: failedKeys.length
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: 'Recovery failed', message: error.message });
   }
 });
 
