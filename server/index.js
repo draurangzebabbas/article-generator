@@ -144,7 +144,18 @@ async function callOpenRouterAPI(messages, model, apiKey, retryCount = 0, option
     const data = await response.json();
     console.log(`✅ OpenRouter API call successful`);
     
-    return data.choices[0].message.content;
+    // Sanitize the response content to prevent control character issues
+    let content = data.choices[0].message.content;
+    if (content) {
+      content = content
+        .replace(/[\x00-\x1F\x7F-\x9F]/g, '') // Remove control characters
+        .replace(/\r\n/g, '\n') // Normalize line endings
+        .replace(/\r/g, '\n') // Normalize line endings
+        .replace(/\t/g, ' ') // Replace tabs with spaces
+        .trim(); // Remove leading/trailing whitespace
+    }
+    
+    return content;
 
   } catch (error) {
     console.error(`❌ Error with OpenRouter API:`, error.message);
@@ -164,12 +175,40 @@ async function callOpenRouterAPI(messages, model, apiKey, retryCount = 0, option
 // Function to parse JSON safely
 function safeParseJSON(jsonString) {
   try {
-    // Clean the string of any potential control characters
-    const cleanedString = jsonString.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
-    return JSON.parse(cleanedString);
+    if (!jsonString || typeof jsonString !== 'string') {
+      console.error('❌ Invalid JSON string input:', typeof jsonString);
+      return null;
+    }
+
+    // Clean the string of any potential control characters and problematic sequences
+    let cleanedString = jsonString
+      .replace(/[\x00-\x1F\x7F-\x9F]/g, '') // Remove control characters
+      .replace(/\r\n/g, '\n') // Normalize line endings
+      .replace(/\r/g, '\n') // Normalize line endings
+      .replace(/\t/g, ' ') // Replace tabs with spaces
+      .replace(/\f/g, ' ') // Replace form feeds with spaces
+      .replace(/\v/g, ' ') // Replace vertical tabs with spaces
+      .trim(); // Remove leading/trailing whitespace
+
+    // Try to extract JSON if it's wrapped in markdown or other formatting
+    const jsonMatch = cleanedString.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      cleanedString = jsonMatch[0];
+    }
+
+    // Additional safety check for common JSON issues
+    if (!cleanedString.startsWith('{') || !cleanedString.endsWith('}')) {
+      console.error('❌ JSON string doesn\'t start/end with braces:', cleanedString.substring(0, 100));
+      return null;
+    }
+
+    const parsed = JSON.parse(cleanedString);
+    console.log('✅ JSON parsed successfully');
+    return parsed;
   } catch (error) {
     console.error('❌ JSON parsing error:', error.message);
-    console.error('❌ JSON string:', jsonString);
+    console.error('❌ JSON string (first 200 chars):', jsonString.substring(0, 200));
+    console.error('❌ JSON string (last 200 chars):', jsonString.substring(Math.max(0, jsonString.length - 200)));
     return null;
   }
 }
@@ -204,11 +243,11 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       });
     }
 
-    // Sanitize inputs to prevent JSON injection
-    const sanitizedMainKeyword = String(mainKeyword).trim();
-    const sanitizedTop10Articles = String(top10Articles).trim();
-    const sanitizedRelatedKeywords = String(relatedKeywords).trim();
-    const sanitizedGuidelines = guidelines ? String(guidelines).trim() : '';
+    // Sanitize inputs to prevent JSON injection and control character issues
+    const sanitizedMainKeyword = String(mainKeyword).replace(/[\x00-\x1F\x7F-\x9F]/g, '').trim();
+    const sanitizedTop10Articles = String(top10Articles).replace(/[\x00-\x1F\x7F-\x9F]/g, '').trim();
+    const sanitizedRelatedKeywords = String(relatedKeywords).replace(/[\x00-\x1F\x7F-\x9F]/g, '').trim();
+    const sanitizedGuidelines = guidelines ? String(guidelines).replace(/[\x00-\x1F\x7F-\x9F]/g, '').trim() : '';
 
     // Log the request
     await supabase.from('analysis_logs').insert({
@@ -565,7 +604,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       processing_time: processingTime
     }).eq('request_id', requestId);
 
-    // Create flat JSON response structure
+    // Create flat JSON response structure with sanitized content
     const flatResponse = {
       request_id: requestId,
       main_keyword: sanitizedMainKeyword,
@@ -573,26 +612,31 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       api_keys_used: usedKeys.length,
       
       // Meta & Toc Results
-      title: metaData.title,
-      excerpt: metaData.excerpt,
-      semantic_keywords: metaData.semantic_keywords,
+      title: metaData.title || '',
+      excerpt: metaData.excerpt || '',
+      semantic_keywords: metaData.semantic_keywords || {},
       section_1_headings: metaData.headings?.section_1 || [],
       section_2_headings: metaData.headings?.section_2 || [],
       faq_questions: metaData.faq || [],
       
-      // Tool Results
-      tool_generator_result: toolResult,
-      validated_tool_result: validatedToolResult,
-      guide_generator_result: guideResult,
+      // Tool Results (sanitized)
+      tool_generator_result: toolResult ? String(toolResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
+      validated_tool_result: validatedToolResult ? String(validatedToolResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
+      guide_generator_result: guideResult ? String(guideResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
       
-      // Content Results
-      section_1_generator_result: section1Result,
-      section_1_summary_result: section1SummaryResult,
-      section_2_generator_result: section2Result,
-      faq_generator_result: faqResult,
+      // Content Results (sanitized)
+      section_1_generator_result: section1Result ? String(section1Result).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
+      section_1_summary_result: section1SummaryResult ? String(section1SummaryResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
+      section_2_generator_result: section2Result ? String(section2Result).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
+      faq_generator_result: faqResult ? String(faqResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
       
-      // Complete Article (combined)
-      complete_article: (section1Result || '') + '\n\n' + (section1SummaryResult || '') + '\n\n' + (section2Result || '') + '\n\n' + (faqResult || ''),
+      // Complete Article (combined and sanitized)
+      complete_article: [
+        section1Result ? String(section1Result).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
+        section1SummaryResult ? String(section1SummaryResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
+        section2Result ? String(section2Result).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
+        faqResult ? String(faqResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : ''
+      ].filter(Boolean).join('\n\n'),
       
       // Status
       status: 'completed',
@@ -609,7 +653,24 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       content_length: flatResponse.complete_article.length
     });
 
-    res.json(flatResponse);
+    // Final validation: ensure the response is valid JSON
+    try {
+      // Test JSON serialization
+      JSON.stringify(flatResponse);
+      console.log('✅ Response validation passed - sending to client');
+      res.json(flatResponse);
+    } catch (jsonError) {
+      console.error('❌ Response JSON validation failed:', jsonError.message);
+      
+      // Send a sanitized error response
+      res.status(500).json({
+        error: 'Response formatting error',
+        message: 'Generated content contains invalid characters',
+        request_id: requestId,
+        processing_time: processingTime,
+        status: 'failed'
+      });
+    }
 
   } catch (error) {
     console.error('Article generation error:', error);
