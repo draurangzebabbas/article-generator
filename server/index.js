@@ -544,9 +544,9 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       return { toolResult, validatedToolResult, guideResult };
     })();
 
-    // Branch B: Section 1 -> Summary -> Section 2
+    // Branch B: Section 1 -> Section 2 (optimized)
     const branchB = (async () => {
-      console.log(`🚀 Starting Branch B: Section 1 -> Summary -> Section 2`);
+      console.log(`🚀 Starting Branch B: Section 1 -> Section 2 (optimized)`);
       
       // Section 1 Generator
       const section1GeneratorMessages = [
@@ -566,31 +566,15 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       const section1Result = await executeModule('Section 1 Generator', section1GeneratorMessages, models.section1Generator, 'B', { maxTokens: 4000 });
       console.log(`✅ Section 1 Generator completed, content length: ${section1Result.length} characters`);
 
-      // Section 1 Summary
-      const section1SummaryMessages = [
-        {
-          role: "system",
-          content: "You are an expert SEO content writer and summarizer. Your task is to generate a clear, concise, and engaging **summary paragraph** of the given Section 1 content of a long-form SEO article.\r\n\r\nThe summary will be used as a **transition paragraph** to smoothly connect Section 1 with Section 2 in the article.\r\n\r\n---\r\n\r\n## Input You Will Receive:  \r\n- **section1_content**: The full text content of Section 1, including all headings and paragraphs.\r\n\r\n---\r\n\r\n## Output Rules (STRICT):  \r\n- Generate **only one paragraph** (3–5 sentences) that captures the key themes and ideas of Section 1.  \r\n- The summary should be **neutral, smooth, and transitional**, preparing readers for the upcoming Section 2 content.  \r\n- Do **NOT** include new information or details not present in Section 1.  \r\n- Avoid repeating entire sentences or headings verbatim; instead, **condense and paraphrase**.  \r\n- Use **natural language** suitable for SEO content.  \r\n- Do **NOT** include any HTML tags or markdown formatting.  \r\n- Keep the summary focused and **avoid extraneous commentary** or opinions.\r\n\r\n---\r\n\r\n## Example Output:  \r\n`This section introduced the foundational concepts and background essential for understanding the topic. Key terms and basic principles were explained to prepare readers for deeper insights. With this groundwork established, the next section will explore advanced strategies and applications.`"
-        },
-        {
-          role: "user",
-          content: section1Result
-        }
-      ];
-
-      const section1SummaryResult = await executeModule('Section 1 Summary', section1SummaryMessages, models.section1Summary, 'B', { maxTokens: 1000 });
-      console.log(`✅ Section 1 Summary completed, summary length: ${section1SummaryResult.length} characters`);
-
-      // Section 2 Generator
+      // Section 2 Generator (optimized - creates its own transition)
       const section2GeneratorMessages = [
         {
           role: "system",
-          content: "You are an expert SEO content writer and HTML formatter. Your role is to generate the **second half** of a long-form, SEO-optimized article using the provided inputs.\r\n\r\nThis content will be pasted directly into a WordPress post body. You must strictly follow all formatting and content rules, outputting only valid HTML using the specified headings.\r\n\r\n---\r\n\r\n### Important Reminders:\r\n- **Do NOT** repeat, summarize, or regenerate any Section 1 content or the Section 1 summary/excerpt.\r\n- The `section1_headings` and `section1_summary` are provided **only for context** to help you craft a smooth transition paragraph.\r\n- Focus solely on the Section 2 headings and their content.\r\n- **You must use each heading in `section2_headings` exactly as written.Do **not** add or remove headings. Do **not** rephrase them\r\n\r\n---\r\n\r\n### You Will Receive:\r\n\r\n- **section1_headings**: A list of Section 1 headings (for context only; not to be included in output)  \r\n- **section1_summary**: A short summary of Section 1 to help with the transition paragraph  \r\n- **section2_headings**: A list of exact headings for Section 2 (you must write only under these, in this order, without changing them)  \r\n- **related_keywords**: A list of secondary keywords to integrate naturally  \r\n- **semantic_keywords**: Categorized support terms to enrich the content  \r\n  - 'informational': Definitions, how-to terms, explanatory terms  \r\n  - 'transactional_optional': Commercial, tool-based, or service-based keywords (use only if naturally relevant)  \r\n  - 'supportive': Context enhancers, synonyms, or LSI-style keywords  \r\n\r\n---\r\n\r\n### Output Rules (STRICT):\r\n- Output only **valid HTML**\r\n- Use only these tags: `<p>`, `<ul>`, `<li>`, `<a>`, `<strong>`, `<em>`, `<blockquote>`, `<code>`, `<br>`,`<h1>`, `<h2>`, `<h3>`, `<h4>`.\r\n- Begin with a clear and smooth **transition paragraph** inside a `<p>` tag that naturally connects Section 1 to Section 2\r\n  - Reference `section1_summary` if provided\r\n- Then, for each item in `section2_headings`, follow this exact structure:\r\n  - Write the heading **properly formated**exact same which are given in **section2_headings** and cover them all\r\n  - Follow it with detailed, well-formatted HTML paragraphs and bullet points as needed\r\n- Do **not** add new sections or headings not in `section2_headings`\r\n- Do **not** include any titles, excerpts, FAQs, or conclusion\r\n- Integrate the **main_keyword** naturally and repeatedly across the content\r\n- Use **related_keywords** and **semantic_keywords** effectively to increase topical relevance\r\n- Length should be **2,500 to 3,000 words**\r\n\r\n---\r\n\r\n### Final Output Format:\r\nReturn only the Section 2 article body as valid, clean HTML:\r\n\r\n- Start with a `<p>` transition paragraph  \r\n- Then for each Section 2 heading:\r\n  - Write the heading **properly formated**exact same which are given in **section2_headings** and cover them all\r\n  - Follow with detailed HTML content using `<p>`, `<ul>`, and other allowed tags  \r\n- No markdown, no wrapping containers, no headings, no summaries — just raw HTML content per section\r\n​"
+          content: "You are an expert SEO content writer and HTML formatter. Your role is to generate the **second half** of a long-form, SEO-optimized article using the provided inputs.\r\n\r\nThis content will be pasted directly into a WordPress post body. You must strictly follow all formatting and content rules, outputting only valid HTML using the specified headings.\r\n\r\n---\r\n\r\n### Important Reminders:\r\n- **Do NOT** repeat, summarize, or regenerate any Section 1 content.\r\n- The `section1_headings` are provided **only for context** to help you craft a smooth transition paragraph.\r\n- Focus solely on the Section 2 headings and their content.\r\n- **You must use each heading in `section2_headings` exactly as written. Do **not** add or remove headings. Do **not** rephrase them.\r\n\r\n---\r\n\r\n### You Will Receive:\r\n\r\n- **section1_headings**: A list of Section 1 headings (for context only; not to be included in output)  \r\n- **section2_headings**: A list of exact headings for Section 2 (you must write only under these, in this order, without changing them)  \r\n- **related_keywords**: A list of secondary keywords to integrate naturally  \r\n- **semantic_keywords**: Categorized support terms to enrich the content  \r\n  - 'informational': Definitions, how-to terms, explanatory terms  \r\n  - 'transactional_optional': Commercial, tool-based, or service-based keywords (use only if naturally relevant)  \r\n  - 'supportive': Context enhancers, synonyms, or LSI-style keywords  \r\n\r\n---\r\n\r\n### Output Rules (STRICT):\r\n- Output only **valid HTML**\r\n- Use only these tags: `<p>`, `<ul>`, `<li>`, `<a>`, `<strong>`, `<em>`, `<blockquote>`, `<code>`, `<br>`,`<h1>`, `<h2>`, `<h3>`, `<h4>`.\r\n- Begin with a clear and smooth **transition paragraph** inside a `<p>` tag that naturally connects Section 1 to Section 2\r\n  - Use the `section1_headings` to understand what was covered in Section 1\r\n  - Create a brief, engaging transition that prepares readers for Section 2 content\r\n- Then, for each item in `section2_headings`, follow this exact structure:\r\n  - Write the heading **exactly as provided** in `section2_headings`\r\n  - Follow it with detailed, well-formatted HTML paragraphs and bullet points as needed\r\n- Do **not** add new sections or headings not in `section2_headings`\r\n- Do **not** include any titles, excerpts, FAQs, or conclusion\r\n- Integrate the **main_keyword** naturally and repeatedly across the content\r\n- Use **related_keywords** and **semantic_keywords** effectively to increase topical relevance\r\n- Length should be **2,500 to 3,000 words**\r\n\r\n---\r\n\r\n### Final Output Format:\r\nReturn only the Section 2 article body as valid, clean HTML:\r\n\r\n- Start with a `<p>` transition paragraph  \r\n- Then for each Section 2 heading:\r\n  - Write the heading **exactly as provided** in `section2_headings`\r\n  - Follow with detailed HTML content using `<p>`, `<ul>`, and other allowed tags  \r\n- No markdown, no wrapping containers, no headings, no summaries — just raw HTML content per section\r\n​"
         },
         {
           role: "user",
           content: `- section1_headings: ${JSON.stringify(metaData.headings?.section_1 || [])}
-- section1_summary: ${section1SummaryResult}
 - section2_headings: ${JSON.stringify(metaData.headings?.section_2 || [])}
 - related_keywords: ${sanitizedRelatedKeywords}
 - semantic_keywords: ${JSON.stringify(metaData.semantic_keywords)}`
@@ -600,7 +584,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       const section2Result = await executeModule('Section 2 Generator', section2GeneratorMessages, models.section2Generator, 'B', { maxTokens: 4000 });
       console.log(`✅ Section 2 Generator completed, content length: ${section2Result.length} characters`);
 
-      return { section1Result, section1SummaryResult, section2Result };
+      return { section1Result, section2Result };
     })();
 
     // Branch FAQ: parallel after meta
@@ -636,14 +620,13 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
 
     // Extract results from branches
     const { toolResult, validatedToolResult, guideResult } = branchAResults;
-    const { section1Result, section1SummaryResult, section2Result } = branchBResults;
+    const { section1Result, section2Result } = branchBResults;
 
     // Store results
     results.tool_generator_result = toolResult;
     results.validated_tool_result = validatedToolResult;
     results.guide_generator_result = guideResult;
     results.section_1_generator_result = section1Result;
-    results.section_1_summary_result = section1SummaryResult;
     results.section_2_generator_result = section2Result;
     results.faq_generator_result = faqResult;
 
@@ -679,21 +662,19 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       
       // Content Results (sanitized)
       section_1_generator_result: section1Result ? String(section1Result).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
-      section_1_summary_result: section1SummaryResult ? String(section1SummaryResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
       section_2_generator_result: section2Result ? String(section2Result).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
       faq_generator_result: faqResult ? String(faqResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
       
       // Complete Article (combined and sanitized)
       complete_article: [
         section1Result ? String(section1Result).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
-        section1SummaryResult ? String(section1SummaryResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
         section2Result ? String(section2Result).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : '',
         faqResult ? String(faqResult).replace(/[\x00-\x1F\x7F-\x9F]/g, '') : ''
       ].filter(Boolean).join('\n\n'),
       
       // Status
       status: 'completed',
-      total_modules_executed: 8,
+      total_modules_executed: 7,
       success_rate: '100%'
     };
 
