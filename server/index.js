@@ -257,72 +257,16 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       status: 'pending'
     });
 
-    // Get user's OpenRouter API keys with smart recovery
+    // Get user's OpenRouter API keys with LinkedIn-style rotation
     console.log(`🔍 Looking for API keys for user: ${req.user.id}`);
     
-    // Smart recovery: Test failed keys before reactivating (10-hour recovery)
-    const tenHoursAgo = new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString();
-    
-    // Get failed keys that are older than 10 hours
-    const { data: failedKeys } = await supabase
-      .from('api_keys')
-      .select('*')
-      .eq('user_id', req.user.id)
-      .eq('provider', 'openrouter')
-      .eq('status', 'failed')
-      .lt('last_failed', tenHoursAgo);
-    
-    // Test each failed key before reactivating
-    if (failedKeys && failedKeys.length > 0) {
-      console.log(`🔄 Testing ${failedKeys.length} failed keys for recovery...`);
-      
-      for (const key of failedKeys) {
-        try {
-          // Test the key with a simple API call
-          const testResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${key.api_key}`,
-              'Content-Type': 'application/json',
-              'HTTP-Referer': OPENROUTER_REFERER,
-              'X-Title': OPENROUTER_TITLE
-            },
-            body: JSON.stringify({
-              model: 'deepseek/deepseek-chat-v3-0324:free',
-              messages: [{ role: 'user', content: 'Test' }],
-              max_tokens: 10
-            })
-          });
-          
-          if (testResponse.ok) {
-            // Key is working - reactivate it
-            await supabase
-              .from('api_keys')
-              .update({ 
-                status: 'active', 
-                failure_count: 0,
-                last_used: new Date().toISOString()
-              })
-              .eq('id', key.id);
-            console.log(`✅ Reactivated key: ${key.key_name}`);
-          } else {
-            // Key is still broken - keep it failed
-            console.log(`❌ Key still broken: ${key.key_name} (${testResponse.status})`);
-          }
-        } catch (error) {
-          // Key test failed - keep it failed
-          console.log(`❌ Key test failed: ${key.key_name} (${error.message})`);
-        }
-      }
-    }
-    
-    // Get available keys (active + rate_limited)
+    // LinkedIn-style rotation: All keys are always available, no time-based blocking
+    // Get all keys regardless of status for smart rotation
     let { data: apiKeys, error: keysError } = await supabase
       .from('api_keys')
       .select('*')
       .eq('user_id', req.user.id)
-      .eq('provider', 'openrouter')
-      .in('status', ['active', 'rate_limited']);
+      .eq('provider', 'openrouter');
 
     console.log(`🔍 API keys query result:`, { apiKeys, keysError });
 
@@ -343,14 +287,6 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
     if (!apiKeys || apiKeys.length === 0) {
       console.log(`❌ No API keys found for user ${req.user.id}`);
       
-      // Let's also check what keys exist for this user (for debugging)
-      const { data: allUserKeys } = await supabase
-        .from('api_keys')
-        .select('id, provider, status, user_id')
-        .eq('user_id', req.user.id);
-      
-      console.log(`🔍 All keys for user ${req.user.id}:`, allUserKeys);
-      
       await supabase.from('analysis_logs').update({
         status: 'failed',
         error_message: 'No OpenRouter API keys available',
@@ -368,36 +304,76 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
     const results = {};
     const usedKeys = [];
 
-    // Branch-aware API key rotation
-    const totalKeys = apiKeys.length;
-    const branchIndices = {
-      META: 0,
-      A: totalKeys >= 2 ? 1 % totalKeys : 0,
-      B: totalKeys >= 3 ? 2 % totalKeys : (totalKeys >= 2 ? 1 : 0),
-      FAQ: totalKeys >= 4 ? 3 % totalKeys : (totalKeys >= 3 ? 2 : (totalKeys >= 2 ? 1 : 0)),
+    // LinkedIn-style API key rotation with smart failure handling
+    const keyRotationManager = {
+      keys: apiKeys,
+      currentIndex: 0,
+      failedKeys: new Set(),
+      rateLimitedKeys: new Set(),
+      
+      // Get next available key with LinkedIn-style rotation
+      getNextKey: function() {
+        // Simple round-robin rotation - all keys get equal chance
+        const key = this.keys[this.currentIndex];
+        this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+        
+        // Rate limited keys get a chance after a short cooldown
+        if (this.rateLimitedKeys.has(key.id)) {
+          const lastRateLimited = key.last_failed;
+          const cooldownMs = 2 * 60 * 1000; // 2 minutes cooldown for rate limits
+          
+          if (lastRateLimited && (Date.now() - new Date(lastRateLimited).getTime()) > cooldownMs) {
+            this.rateLimitedKeys.delete(key.id);
+            console.log(`🔄 Rate limited key ${key.key_name} is now available again`);
+          } else {
+            // Still rate limited, get next key
+            return this.getNextKey();
+          }
+        }
+        
+        // Failed keys get immediate retry (no waiting time)
+        if (this.failedKeys.has(key.id)) {
+          this.failedKeys.delete(key.id);
+          console.log(`🔄 Failed key ${key.key_name} is being retried immediately`);
+        }
+        
+        return key;
+      },
+      
+      // Mark key as failed (temporary)
+      markKeyFailed: function(keyId, reason) {
+        this.failedKeys.add(keyId);
+        console.log(`⚠️ Key ${keyId} marked as temporarily failed: ${reason}`);
+      },
+      
+      // Mark key as rate limited (temporary with cooldown)
+      markKeyRateLimited: function(keyId) {
+        this.rateLimitedKeys.add(keyId);
+        console.log(`⚠️ Key ${keyId} marked as rate limited (5 min cooldown)`);
+      },
+      
+      // Mark key as temporarily failed (will be retried)
+      markKeyTemporarilyFailed: function(keyId) {
+        this.failedKeys.add(keyId);
+        console.log(`⚠️ Key ${keyId} marked as temporarily failed (will retry)`);
+      }
     };
 
-    const getNextApiKeyForBranch = (branch) => {
-      const index = branchIndices[branch] % totalKeys;
-      branchIndices[branch] = (branchIndices[branch] + 1) % totalKeys;
-      return apiKeys[index];
-    };
-
-    // Helper function to execute module with branch-aware key rotation
-    const executeModule = async (moduleName, messages, model, branch, options = {}) => {
+    // Helper function to execute module with LinkedIn-style key rotation
+    const executeModule = async (moduleName, messages, model, options = {}) => {
       let success = false;
       let attempts = 0;
-      const maxAttempts = Math.min(3, apiKeys.length);
+      const maxAttempts = Math.min(apiKeys.length * 2, 10); // More attempts allowed
 
       while (!success && attempts < maxAttempts) {
-        const currentKey = getNextApiKeyForBranch(branch);
+        const currentKey = keyRotationManager.getNextKey();
         
         try {
-          console.log(`🔄 Executing ${moduleName} with API key: ${currentKey.key_name} (Branch: ${branch})`);
+          console.log(`🔄 Executing ${moduleName} with API key: ${currentKey.key_name} (Attempt ${attempts + 1})`);
           
           const result = await callOpenRouterAPI(messages, model, currentKey.api_key, 0, options);
           
-          // Update key usage
+          // Update key usage - mark as active
           await supabase.from('api_keys').update({
             last_used: new Date().toISOString(),
             failure_count: 0,
@@ -406,34 +382,50 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
 
           usedKeys.push(currentKey.id);
           success = true;
-          console.log(`✅ ${moduleName} completed successfully`);
+          console.log(`✅ ${moduleName} completed successfully with key: ${currentKey.key_name}`);
           
           return result;
           
         } catch (error) {
           console.error(`❌ Error in ${moduleName} with API key ${currentKey.key_name}:`, error.message);
           
-          // Check if it's a rate limit, credit issue, or invalid key
-          const isRateLimit = error.message.includes('rate') || error.message.includes('credit') || error.message.includes('429') || error.message.includes('402');
+          // Smart error classification for LinkedIn-style handling
+          const isRateLimit = error.message.includes('rate') || error.message.includes('429') || error.message.includes('credit') || error.message.includes('402');
           const isInvalidKey = error.message.includes('Invalid API key') || error.message.includes('401');
           const isNetworkError = error.message.includes('network') || error.message.includes('timeout') || error.message.includes('fetch');
           
-          // Never permanently block keys - all keys can recover after 10 hours
           if (isRateLimit) {
+            // Rate limited: temporary cooldown, then retry
             await supabase.from('api_keys').update({
               status: 'rate_limited',
               last_failed: new Date().toISOString(),
               failure_count: currentKey.failure_count + 1
             }).eq('id', currentKey.id);
-            console.log(`⚠️ Marked API key as rate limited: ${currentKey.key_name}`);
-          } else {
-            // For all other errors (including invalid keys), mark as failed but allow recovery after 10 hours
+            
+            keyRotationManager.markKeyRateLimited(currentKey.id);
+            console.log(`⚠️ Key ${currentKey.key_name} rate limited - will retry after 2 minutes`);
+            
+          } else if (isInvalidKey) {
+            // Invalid key: mark as failed but will retry (no permanent blocking)
             await supabase.from('api_keys').update({
               status: 'failed',
               last_failed: new Date().toISOString(),
               failure_count: currentKey.failure_count + 1
             }).eq('id', currentKey.id);
-            console.log(`⚠️ Marked API key as failed (will recover after 10 hours): ${currentKey.key_name} (${currentKey.failure_count + 1} failures)`);
+            
+            keyRotationManager.markKeyTemporarilyFailed(currentKey.id);
+            console.log(`⚠️ Key ${currentKey.key_name} is invalid but will retry in rotation`);
+            
+          } else {
+            // Other errors: temporary failure, retry immediately
+            await supabase.from('api_keys').update({
+              status: 'failed',
+              last_failed: new Date().toISOString(),
+              failure_count: currentKey.failure_count + 1
+            }).eq('id', currentKey.id);
+            
+            keyRotationManager.markKeyFailed(currentKey.id, error.message);
+            console.log(`⚠️ Key ${currentKey.key_name} temporarily failed - will retry immediately`);
           }
 
           attempts++;
@@ -441,7 +433,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       }
 
       if (!success) {
-        throw new Error(`All API keys failed for ${moduleName}`);
+        throw new Error(`All API keys failed for ${moduleName} after ${attempts} attempts`);
       }
     };
 
@@ -462,7 +454,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
       }
     ];
 
-    const metaResult = await executeModule('Meta & Toc Generator', metaGeneratorMessages, models.metaGenerator, 'META', { maxTokens: 3000 });
+    const metaResult = await executeModule('Meta & Toc Generator', metaGeneratorMessages, models.metaGenerator, { maxTokens: 3000 });
     const metaData = safeParseJSON(metaResult);
     
     if (!metaData) {
@@ -504,7 +496,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
         }
       ];
 
-      const toolResult = await executeModule('Tool Generator', toolGeneratorMessages, models.toolGenerator, 'A', { maxTokens: 4000 });
+      const toolResult = await executeModule('Tool Generator', toolGeneratorMessages, models.toolGenerator, { maxTokens: 4000 });
       console.log(`✅ Tool Generator completed, tool length: ${toolResult.length} characters`);
 
       // Tool Validator
@@ -519,7 +511,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
         }
       ];
 
-      const validatedToolResult = await executeModule('Tool Validator', toolValidatorMessages, models.toolValidator, 'A', { maxTokens: 4000 });
+      const validatedToolResult = await executeModule('Tool Validator', toolValidatorMessages, models.toolValidator, { maxTokens: 4000 });
       console.log(`✅ Tool Validator completed, validated tool length: ${validatedToolResult.length} characters`);
 
       // Guide Generator
@@ -538,7 +530,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
         }
       ];
 
-      const guideResult = await executeModule('Guide Generator', guideGeneratorMessages, models.guideGenerator, 'A', { maxTokens: 4000 });
+      const guideResult = await executeModule('Guide Generator', guideGeneratorMessages, models.guideGenerator, { maxTokens: 4000 });
       console.log(`✅ Guide Generator completed, guide length: ${guideResult.length} characters`);
 
       return { toolResult, validatedToolResult, guideResult };
@@ -563,7 +555,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
         }
       ];
 
-      const section1Result = await executeModule('Section 1 Generator', section1GeneratorMessages, models.section1Generator, 'B', { maxTokens: 4000 });
+      const section1Result = await executeModule('Section 1 Generator', section1GeneratorMessages, models.section1Generator, { maxTokens: 4000 });
       console.log(`✅ Section 1 Generator completed, content length: ${section1Result.length} characters`);
 
       // Section 2 Generator (optimized - creates its own transition)
@@ -581,7 +573,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
         }
       ];
 
-      const section2Result = await executeModule('Section 2 Generator', section2GeneratorMessages, models.section2Generator, 'B', { maxTokens: 4000 });
+      const section2Result = await executeModule('Section 2 Generator', section2GeneratorMessages, models.section2Generator, { maxTokens: 4000 });
       console.log(`✅ Section 2 Generator completed, content length: ${section2Result.length} characters`);
 
       return { section1Result, section2Result };
@@ -604,7 +596,7 @@ app.post('/api/generate-article', rateLimitMiddleware, authMiddleware, async (re
         }
       ];
 
-      const faqResult = await executeModule('FAQ Generator', faqGeneratorMessages, models.faqGenerator, 'FAQ', { maxTokens: 2000 });
+      const faqResult = await executeModule('FAQ Generator', faqGeneratorMessages, models.faqGenerator, { maxTokens: 2000 });
       console.log(`✅ FAQ Generator completed, FAQ length: ${faqResult.length} characters`);
       
       return faqResult;
@@ -750,70 +742,14 @@ app.post('/api/generate-article-webhook', rateLimitMiddleware, authMiddleware, a
       status: 'pending'
     });
 
-    // Get user's OpenRouter API keys with smart recovery
-    // Smart recovery: Test failed keys before reactivating (10-hour recovery)
-    const tenHoursAgo = new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString();
-    
-    // Get failed keys that are older than 10 hours
-    const { data: failedKeys } = await supabase
-      .from('api_keys')
-      .select('*')
-      .eq('user_id', req.user.id)
-      .eq('provider', 'openrouter')
-      .eq('status', 'failed')
-      .lt('last_failed', tenHoursAgo);
-    
-    // Test each failed key before reactivating
-    if (failedKeys && failedKeys.length > 0) {
-      console.log(`🔄 Testing ${failedKeys.length} failed keys for recovery...`);
-      
-      for (const key of failedKeys) {
-        try {
-          // Test the key with a simple API call
-          const testResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${key.api_key}`,
-              'Content-Type': 'application/json',
-              'HTTP-Referer': OPENROUTER_REFERER,
-              'X-Title': OPENROUTER_TITLE
-            },
-            body: JSON.stringify({
-              model: 'deepseek/deepseek-chat-v3-0324:free',
-              messages: [{ role: 'user', content: 'Test' }],
-              max_tokens: 10
-            })
-          });
-          
-          if (testResponse.ok) {
-            // Key is working - reactivate it
-            await supabase
-              .from('api_keys')
-              .update({ 
-                status: 'active', 
-                failure_count: 0,
-                last_used: new Date().toISOString()
-              })
-              .eq('id', key.id);
-            console.log(`✅ Reactivated key: ${key.key_name}`);
-          } else {
-            // Key is still broken - keep it failed
-            console.log(`❌ Key still broken: ${key.key_name} (${testResponse.status})`);
-          }
-        } catch (error) {
-          // Key test failed - keep it failed
-          console.log(`❌ Key test failed: ${key.key_name} (${error.message})`);
-        }
-      }
-    }
-    
-    // Get available keys (active + rate_limited)
+    // Get user's OpenRouter API keys with LinkedIn-style rotation
+    // LinkedIn-style rotation: All keys are always available, no time-based blocking
+    // Get all keys regardless of status for smart rotation
     const { data: apiKeys, error: keysError } = await supabase
       .from('api_keys')
       .select('*')
       .eq('user_id', req.user.id)
-      .eq('provider', 'openrouter')
-      .in('status', ['active', 'rate_limited']);
+      .eq('provider', 'openrouter');
 
     console.log(`🔍 API keys query result:`, { apiKeys, keysError });
 
@@ -833,14 +769,6 @@ app.post('/api/generate-article-webhook', rateLimitMiddleware, authMiddleware, a
 
     if (!apiKeys || apiKeys.length === 0) {
       console.log(`❌ No API keys found for user ${req.user.id}`);
-      
-      // Let's also check what keys exist for this user (for debugging)
-      const { data: allUserKeys } = await supabase
-        .from('api_keys')
-        .select('id, provider, status, user_id')
-        .eq('user_id', req.user.id);
-      
-      console.log(`🔍 All keys for user ${req.user.id}:`, allUserKeys);
       
       await supabase.from('analysis_logs').update({
         status: 'failed',
@@ -1005,44 +933,57 @@ app.get('/api/debug/keys', rateLimitMiddleware, authMiddleware, async (req, res)
   }
 });
 
-// Manual key recovery endpoint (requires auth)
+// Manual key recovery endpoint (requires auth) - LinkedIn-style
 app.post('/api/recover-keys', rateLimitMiddleware, authMiddleware, async (req, res) => {
   try {
     const { key_ids } = req.body; // Optional: specific key IDs to recover
     
-    // Get failed keys
+    // Get all keys regardless of status for LinkedIn-style recovery
     let query = supabase
       .from('api_keys')
       .select('*')
       .eq('user_id', req.user.id)
-      .eq('provider', 'openrouter')
-      .eq('status', 'failed');
+      .eq('provider', 'openrouter');
     
     if (key_ids && Array.isArray(key_ids) && key_ids.length > 0) {
       query = query.in('id', key_ids);
     }
     
-    const { data: failedKeys, error } = await query;
+    const { data: allKeys, error } = await query;
     
     if (error) {
-      return res.status(500).json({ error: 'Failed to fetch failed keys', message: error.message });
+      return res.status(500).json({ error: 'Failed to fetch API keys', message: error.message });
     }
     
-    if (!failedKeys || failedKeys.length === 0) {
+    if (!allKeys || allKeys.length === 0) {
       return res.json({ 
         status: 'success', 
-        message: 'No failed keys to recover (all keys are either active, rate_limited, or failed less than 10 hours ago)',
+        message: 'No API keys found for this user',
         recovered: 0,
         still_failed: 0
       });
     }
     
-    console.log(`🔄 Manually testing ${failedKeys.length} failed keys...`);
+    // Filter keys that need recovery (failed or rate_limited)
+    const keysToRecover = allKeys.filter(key => 
+      key.status === 'failed' || key.status === 'rate_limited'
+    );
+    
+    if (keysToRecover.length === 0) {
+      return res.json({ 
+        status: 'success', 
+        message: 'All keys are already active and ready for use',
+        recovered: 0,
+        still_failed: 0
+      });
+    }
+    
+    console.log(`🔄 LinkedIn-style recovery: Testing ${keysToRecover.length} keys...`);
     
     let recovered = 0;
     let stillFailed = 0;
     
-    for (const key of failedKeys) {
+    for (const key of keysToRecover) {
       try {
         // Test the key with a simple API call
         const testResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -1061,7 +1002,7 @@ app.post('/api/recover-keys', rateLimitMiddleware, authMiddleware, async (req, r
         });
         
         if (testResponse.ok) {
-          // Key is working - reactivate it
+          // Key is working - reactivate it immediately
           await supabase
             .from('api_keys')
             .update({ 
@@ -1070,24 +1011,58 @@ app.post('/api/recover-keys', rateLimitMiddleware, authMiddleware, async (req, r
               last_used: new Date().toISOString()
             })
             .eq('id', key.id);
-          console.log(`✅ Manually recovered key: ${key.key_name}`);
+          console.log(`✅ LinkedIn-style recovery: Key ${key.key_name} is now active`);
           recovered++;
+        } else if (testResponse.status === 401) {
+          // Invalid key - mark as failed but will retry (no permanent blocking)
+          await supabase
+            .from('api_keys')
+            .update({ 
+              status: 'failed',
+              last_failed: new Date().toISOString(),
+              failure_count: key.failure_count + 1
+            })
+            .eq('id', key.id);
+          console.log(`⚠️ Key ${key.key_name} is invalid but will retry in rotation`);
+          stillFailed++;
+        } else if (testResponse.status === 429 || testResponse.status === 402) {
+          // Rate limited or credit issue - keep as rate_limited
+          console.log(`⚠️ Key ${key.key_name} is rate limited or has credit issues`);
+          stillFailed++;
         } else {
-          console.log(`❌ Key still broken: ${key.key_name} (${testResponse.status})`);
+          // Other errors - mark as failed but recoverable
+          await supabase
+            .from('api_keys')
+            .update({ 
+              status: 'failed',
+              last_failed: new Date().toISOString(),
+              failure_count: key.failure_count + 1
+            })
+            .eq('id', key.id);
+          console.log(`⚠️ Key ${key.key_name} has other issues but is recoverable`);
           stillFailed++;
         }
       } catch (error) {
-        console.log(`❌ Key test failed: ${key.key_name} (${error.message})`);
+        // Network or other errors - mark as failed but recoverable
+        await supabase
+          .from('api_keys')
+          .update({ 
+            status: 'failed',
+            last_failed: new Date().toISOString(),
+            failure_count: key.failure_count + 1
+          })
+          .eq('id', key.id);
+        console.log(`⚠️ Key ${key.key_name} has network issues but is recoverable`);
         stillFailed++;
       }
     }
     
     res.json({ 
       status: 'success', 
-      message: `Recovery attempt completed`,
+      message: `LinkedIn-style recovery completed - no waiting time required`,
       recovered,
       still_failed: stillFailed,
-      total_tested: failedKeys.length
+      total_tested: keysToRecover.length
     });
     
   } catch (error) {
